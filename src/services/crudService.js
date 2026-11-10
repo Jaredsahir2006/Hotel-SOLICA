@@ -1,0 +1,198 @@
+import { supabase } from "../config/supabase";
+
+// Datos de auditoría que usan todas las tablas del sistema.
+const AUD = { usuario: "WEB", pc: "PC-WEB" };
+
+const ahora = () => new Date().toISOString();
+
+// Traduce errores comunes de Supabase/Postgres a mensajes claros.
+const traducir = (error) => {
+    if (error.code === "23503")
+        return "No se puede completar: el registro está relacionado con otros datos.";
+    if (error.code === "23505")
+        return "Ya existe un registro con ese valor único (por ejemplo documento o número repetido).";
+    if (error.code === "23502")
+        return `Falta un dato obligatorio en la base de datos. ${error.message}`;
+    if (error.code === "42P01")
+        return "La tabla no existe en Supabase. Revisa el nombre en config/entidades.js.";
+    if (error.code === "42703")
+        return `Una columna no existe en la tabla. Revisa config/entidades.js. ${error.message}`;
+    if (error.code === "42501")
+        return "Sin permisos (RLS). Revisa las políticas de la tabla en Supabase.";
+    return error.message;
+};
+
+const lanzar = (error) => {
+    if (error) throw new Error(traducir(error));
+};
+
+// Leer: solo registros activos (estado = '1')
+export const listar = async (tabla, pk) => {
+    const { data, error } = await supabase
+        .from(tabla)
+        .select("*")
+        .eq("estado", "1")
+        .order(pk, { ascending: true });
+    lanzar(error);
+    return data;
+};
+
+// Máximo de registros por página en todos los CRUD.
+export const POR_PAGINA = 25;
+
+// Leer una página de registros activos, con búsqueda y filtros (server-side).
+export const listarPaginado = async (
+    tabla,
+    pk,
+    {
+        pagina = 1,
+        pageSize = POR_PAGINA,
+        busqueda = "",
+        columnasBusqueda = [],
+        filtros = {},
+    } = {}
+) => {
+    const tamanoPagina = Math.min(100, Math.max(1, Math.floor(Number(pageSize) || POR_PAGINA)));
+    const numeroPagina = Math.max(1, Math.floor(Number(pagina) || 1));
+    const desde = (numeroPagina - 1) * tamanoPagina;
+
+    let consulta = supabase
+        .from(tabla)
+        .select("*", { count: "exact" })
+        .eq("estado", "1");
+
+    const termino = String(busqueda || "").trim().replace(/[%_,()]/g, " ").trim();
+    if (termino && columnasBusqueda.length) {
+        const clause = columnasBusqueda
+            .map((c) => `${c}.ilike.%${termino}%`)
+            .join(",");
+        consulta = consulta.or(clause);
+    }
+
+    for (const [campo, valor] of Object.entries(filtros || {})) {
+        if (campo && valor !== "" && valor != null) {
+            consulta = consulta.eq(campo, valor);
+        }
+    }
+
+    const { data, error, count } = await consulta
+        .order(pk, { ascending: true })
+        .range(desde, desde + tamanoPagina - 1);
+    lanzar(error);
+
+    const total = count || 0;
+    return {
+        data,
+        total,
+        pagina: numeroPagina,
+        totalPaginas: Math.max(1, Math.ceil(total / tamanoPagina)),
+    };
+};
+
+export const insertar = async (tabla, fila) => {
+    const { error } = await supabase.from(tabla).insert([{
+        ...fila,
+        usucre: AUD.usuario,
+        pccre: AUD.pc,
+        feccre: ahora(),
+        estado: "1",
+    }]);
+    lanzar(error);
+};
+
+export const buscarPersonaPorDni = async (numero) => {
+    const { data: tipoDni, error: errorTipo } = await supabase
+        .from("tipo_identidad")
+        .select("id_tipoidentidad")
+        .eq("estado", "1")
+        .ilike("abreviatura", "DNI")
+        .maybeSingle();
+    lanzar(errorTipo);
+    if (!tipoDni) throw new Error("No está configurado el tipo de identidad DNI.");
+
+    const { data: persona, error } = await supabase
+        .from("persona")
+        .select("*")
+        .eq("estado", "1")
+        .eq("id_tipoidentidad", tipoDni.id_tipoidentidad)
+        .eq("n_documento", numero)
+        .maybeSingle();
+    lanzar(error);
+    return { persona, id_tipoidentidad: tipoDni.id_tipoidentidad };
+};
+
+export const guardarEmpleadoConPersona = async ({ empleado, persona }) => {
+    const documento = String(persona.n_documento || "").trim();
+    if (!/^\d{8}$/.test(documento)) {
+        throw new Error("Consulta un DNI válido antes de guardar el empleado.");
+    }
+
+    const existente = await buscarPersonaPorDni(documento);
+    let idPersona = existente.persona?.id_persona;
+
+    if (!idPersona) {
+        const { data: personaCreada, error: errorPersona } = await supabase
+            .from("persona")
+            .insert([{
+                ...persona,
+                nombre: String(persona.nombre || "").trim(),
+                ap_paterno: String(persona.ap_paterno || "").trim(),
+                ap_materno: String(persona.ap_materno || "").trim() || null,
+                f_nacimiento: persona.f_nacimiento || null,
+                email: String(persona.email || "").trim() || null,
+                celular: String(persona.celular || "").trim() || null,
+                genero: persona.genero || null,
+                direccion: String(persona.direccion || "").trim() || null,
+                id_tipoidentidad: existente.id_tipoidentidad,
+                n_documento: documento,
+                id_distrito: Number(persona.id_distrito),
+                usucre: AUD.usuario,
+                pccre: AUD.pc,
+                feccre: ahora(),
+                estado: "1",
+            }])
+            .select("id_persona")
+            .single();
+        lanzar(errorPersona);
+        idPersona = personaCreada.id_persona;
+    }
+
+    const { error: errorEmpleado } = await supabase
+        .from("empleado")
+        .insert([{
+            ...empleado,
+            id_persona: idPersona,
+            usucre: AUD.usuario,
+            pccre: AUD.pc,
+            feccre: ahora(),
+            estado: "1",
+        }]);
+    if (errorEmpleado) {
+        const mensaje = traducir(errorEmpleado);
+        if (!existente.persona) {
+            throw new Error(`La persona quedó registrada, pero no se pudo completar el alta del empleado: ${mensaje}`);
+        }
+        throw new Error(mensaje);
+    }
+};
+
+export const actualizar = async (tabla, pk, id, fila) => {
+    const { error } = await supabase.from(tabla).update({
+        ...fila,
+        usumod: AUD.usuario,
+        pcmod: AUD.pc,
+        fecmod: ahora(),
+    }).eq(pk, id);
+    lanzar(error);
+};
+
+// Eliminar = baja lógica (estado = '0'), igual que el resto del sistema.
+export const eliminar = async (tabla, pk, id) => {
+    const { error } = await supabase.from(tabla).update({
+        estado: "0",
+        usumod: AUD.usuario,
+        pcmod: AUD.pc,
+        fecmod: ahora(),
+    }).eq(pk, id);
+    lanzar(error);
+};
